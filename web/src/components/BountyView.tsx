@@ -3,10 +3,15 @@
 import { useCallback } from "react";
 import { useAccount } from "wagmi";
 import { useBounty } from "@/hooks/useBounty";
+import { useReadContract } from "wagmi";
 import { isAddressEqual } from "@/lib/format";
 import { decodeAiReview } from "@/lib/aiReview";
+import bountyJudgeAbi from "@/abi/BountyJudge";
+import { contractAddress, isContractConfigured } from "@/config/contract";
+import { ritualChain } from "@/config/wagmi";
 import { BountyDetail } from "@/components/BountyDetail";
-import { SubmitAnswer } from "@/components/SubmitAnswer";
+import { CommitAnswer } from "@/components/CommitAnswer";
+import { EncryptedSubmission } from "@/components/EncryptedSubmission";
 import { JudgeAll } from "@/components/JudgeAll";
 import { FinalizeWinner } from "@/components/FinalizeWinner";
 import { AIReviewDisplay } from "@/components/AIReviewDisplay";
@@ -16,6 +21,21 @@ import { Card, CardBody, Notice, Spinner } from "@/components/ui";
 export function BountyView({ bountyId }: { bountyId: bigint }) {
   const { address } = useAccount();
   const { bounty, isLoading, isError, refetch } = useBounty(bountyId);
+
+  // Check if bounty is encrypted
+  const metaQ = useReadContract({
+    address: contractAddress,
+    abi: bountyJudgeAbi,
+    functionName: "getBountyMetadata",
+    args: bountyId !== undefined ? [bountyId] : undefined,
+    chainId: ritualChain.id,
+    query: { enabled: bountyId !== undefined && isContractConfigured },
+  });
+
+  const isEncrypted = metaQ.data?.[0] ?? false;
+  const executorPublicKey = metaQ.data?.[2]
+    ? `0x${Buffer.from((metaQ.data[2] as unknown as Uint8Array).slice(0, 20)).toString("hex")}`
+    : undefined;
 
   const reload = useCallback(() => {
     void refetch();
@@ -59,15 +79,31 @@ export function BountyView({ bountyId }: { bountyId: bigint }) {
       {/* Left column: details + owner/participant actions */}
       <div className="space-y-4">
         <BountyDetail bountyId={bountyId} bounty={bounty} isOwner={isOwner} />
-        <SubmitAnswer
-          bountyId={bountyId}
-          bounty={bounty}
-          onSubmitted={reload}
-        />
+
+        {/* Commit-Reveal (Standard Track) */}
+        {!isEncrypted && (
+          <CommitAnswer
+            bountyId={bountyId}
+            bounty={bounty}
+            onDone={reload}
+          />
+        )}
+
+        {/* Encrypted Submission (Advanced Track) */}
+        {isEncrypted && (
+          <EncryptedSubmission
+            bountyId={bountyId}
+            bounty={bounty}
+            executorPublicKey={executorPublicKey}
+            onSubmitted={reload}
+          />
+        )}
+
         <JudgeAll
           bountyId={bountyId}
           bounty={bounty}
           isOwner={isOwner}
+          isEncrypted={isEncrypted}
           onJudged={reload}
         />
         <FinalizeWinner

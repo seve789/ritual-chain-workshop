@@ -2,11 +2,11 @@
 
 import { useState } from "react";
 import { useAccount, usePublicClient } from "wagmi";
-import aiJudgeAbi from "@/abi/AIJudge";
+import bountyJudgeAbi from "@/abi/BountyJudge";
 import { contractAddress, executorAddress } from "@/config/contract";
 import { ritualChain } from "@/config/wagmi";
 import type { Bounty } from "@/lib/bounty";
-import { buildJudgeAllLlmInput, type JudgeSubmission } from "@/lib/ritualLlm";
+import { buildJudgeAllLlmInput, buildEncryptedJudgeAllLlmInput, type JudgeSubmission } from "@/lib/ritualLlm";
 import { useWriteTx } from "@/hooks/useWriteTx";
 import { useRitualWalletStatus } from "@/hooks/useRitualWalletStatus";
 import { RitualWalletPanel } from "@/components/RitualWalletPanel";
@@ -18,11 +18,13 @@ export function JudgeAll({
   bountyId,
   bounty,
   isOwner,
+  isEncrypted,
   onJudged,
 }: {
   bountyId: bigint;
   bounty: Bounty;
   isOwner: boolean;
+  isEncrypted?: boolean;
   onJudged: () => void;
 }) {
   const { address } = useAccount();
@@ -31,14 +33,12 @@ export function JudgeAll({
   const [gatherError, setGatherError] = useState<string | null>(null);
   const tx = useWriteTx(() => onJudged());
 
-  // Preflight the *connected* wallet's RitualWallet funding (not the bounty
-  // contract) — judgeAll spends prepaid+locked RITUAL via the LLM precompile.
   const walletStatus = useRitualWalletStatus(address);
 
   const count = Number(bounty.submissionCount);
 
   // Gate per spec: owner only, has submissions, not yet judged.
-  if (!isOwner || bounty.judged || bounty.finalized || count === 0) {
+  if (!isOwner || bounty.judged || bounty.finalized) {
     return null;
   }
 
@@ -47,36 +47,85 @@ export function JudgeAll({
     setGatherError(null);
     setGathering(true);
     try {
-      // 1–2. Load every submission for this bounty.
-      const submissions: JudgeSubmission[] = [];
-      for (let i = 0; i < count; i++) {
-        const [submitter, answer] = await publicClient.readContract({
+      if (isEncrypted) {
+        // ── Encrypted mode: gather encrypted submissions ──
+        const encCount = await publicClient.readContract({
           address: contractAddress,
-          abi: aiJudgeAbi,
-          functionName: "getSubmission",
-          args: [bountyId, BigInt(i)],
+          abi: bountyJudgeAbi,
+          functionName: "getEncryptedSubmissionCount",
+          args: [bountyId],
         });
-        submissions.push({ index: i, submitter, answer });
+
+        const submissions: JudgeSubmission[] = [];
+        for (let i = 0; i < Number(encCount); i++) {
+          const [submitter, encryptedAnswer, answerHash] =
+            await publicClient.readContract({
+              address: contractAddress,
+              abi: bountyJudgeAbi,
+              functionName: "getEncryptedSubmission",
+              args: [bountyId, BigInt(i)],
+            });
+          submissions.push({
+            index: i,
+            submitter,
+            answer: encryptedAnswer as unknown as string,
+            isEncrypted: true,
+            answerHash,
+          });
+        }
+
+        const llmInput = buildEncryptedJudgeAllLlmInput({
+          executorAddress,
+          title: bounty.title,
+          rubric: bounty.rubric,
+          submissions,
+        });
+
+        setGathering(false);
+
+        await tx.run({
+          address: contractAddress,
+          abi: bountyJudgeAbi,
+          functionName: "judgeAll",
+          args: [bountyId, llmInput],
+          chainId: ritualChain.id,
+        });
+      } else {
+        // ── Standard commit-reveal mode ──
+        const submissions: JudgeSubmission[] = [];
+        if (count === 0) {
+          setGathering(false);
+          setGatherError("No revealed submissions to judge.");
+          return;
+        }
+
+        for (let i = 0; i < count; i++) {
+          const [submitter, answer] = await publicClient.readContract({
+            address: contractAddress,
+            abi: bountyJudgeAbi,
+            functionName: "getSubmission",
+            args: [bountyId, BigInt(i)],
+          });
+          submissions.push({ index: i, submitter, answer });
+        }
+
+        const llmInput = buildJudgeAllLlmInput({
+          executorAddress,
+          title: bounty.title,
+          rubric: bounty.rubric,
+          submissions,
+        });
+
+        setGathering(false);
+
+        await tx.run({
+          address: contractAddress,
+          abi: bountyJudgeAbi,
+          functionName: "judgeAll",
+          args: [bountyId, llmInput],
+          chainId: ritualChain.id,
+        });
       }
-
-      // 3–4. Build the batch judging prompt and encode the Ritual LLM request.
-      const llmInput = buildJudgeAllLlmInput({
-        executorAddress,
-        title: bounty.title,
-        rubric: bounty.rubric,
-        submissions,
-      });
-
-      setGathering(false);
-
-      // 5. Submit it on-chain.
-      await tx.run({
-        address: contractAddress,
-        abi: aiJudgeAbi,
-        functionName: "judgeAll",
-        args: [bountyId, llmInput],
-        chainId: ritualChain.id,
-      });
     } catch (e) {
       setGathering(false);
       setGatherError(
@@ -94,22 +143,41 @@ export function JudgeAll({
     <Card>
       <CardHeader
         title="Judge all submissions"
-        subtitle="Sends one Ritual LLM request ranking every submission."
+        subtitle={
+          isEncrypted
+            ? "Sends one Ritual LLM request — encrypted answers decrypted inside TEE."
+            : "Sends one Ritual LLM request ranking every revealed submission."
+        }
       />
       <CardBody className="space-y-3">
         <Notice tone="indigo">AI review is advisory. The bounty owner finalizes the winner.</Notice>
 
+        {isEncrypted && (
+          <Notice tone="amber">
+            Encrypted mode: answers are decrypted inside the TEE enclave. The LLM prompt uses
+            template substitution via encryptedSecrets.
+          </Notice>
+        )}
+
         <RitualWalletPanel status={walletStatus} onDeposited={walletStatus.refetch} />
+
+        {count === 0 && !isEncrypted && (
+          <Notice tone="red">
+            No revealed submissions yet. Participants must reveal their answers after the deadline.
+          </Notice>
+        )}
 
         <Button onClick={handleJudge} disabled={busy || !fundingReady} className="w-full">
           {gathering ? (
             <>
-              <Spinner /> Gathering {count} submissions…
+              <Spinner /> Gathering submissions…
             </>
           ) : tx.isBusy ? (
             "Judging…"
           ) : !fundingReady ? (
             "Fund RitualWallet to judge"
+          ) : isEncrypted ? (
+            "Judge encrypted submissions"
           ) : (
             `Judge all (${count})`
           )}

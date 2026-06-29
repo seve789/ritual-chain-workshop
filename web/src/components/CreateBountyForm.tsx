@@ -5,7 +5,7 @@ import { useAccount } from "wagmi";
 import { parseEther, parseEventLogs } from "viem";
 import { contractAddress, isContractConfigured } from "@/config/contract";
 import { ritualChain } from "@/config/wagmi";
-import aiJudgeAbi from "@/abi/AIJudge";
+import bountyJudgeAbi from "@/abi/BountyJudge";
 import { useWriteTx } from "@/hooks/useWriteTx";
 import {
   Card,
@@ -21,10 +21,8 @@ import {
 
 const explorerBase = ritualChain.blockExplorers?.default.url;
 
-/** Default datetime-local value = now + 1 hour, in the input's expected format. */
 function defaultDeadline(): string {
   const d = new Date(Date.now() + 60 * 60 * 1000);
-  // Strip seconds/tz to YYYY-MM-DDTHH:mm in local time.
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
     d.getHours(),
@@ -39,11 +37,15 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
   const [reward, setReward] = useState("");
   const [createdId, setCreatedId] = useState<bigint | null>(null);
 
-  // Once confirmed, pull the new bountyId out of the BountyCreated event log.
+  // Encrypted bounty (Advanced Track) fields
+  const [enableEncrypted, setEnableEncrypted] = useState(false);
+  const [executorAddress, setExecutorAddress] = useState("");
+  const [executorPubKey, setExecutorPubKey] = useState("");
+
   const tx = useWriteTx((receipt) => {
     try {
       const logs = parseEventLogs({
-        abi: aiJudgeAbi,
+        abi: bountyJudgeAbi,
         eventName: "BountyCreated",
         logs: receipt.logs,
       });
@@ -53,11 +55,10 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
         onCreated?.(id);
       }
     } catch {
-      /* couldn't decode — not fatal */
+      /* not fatal */
     }
   });
 
-  // Pure, render-safe validation (no clock reads here — see handleSubmit).
   const validation = useMemo(() => {
     if (!title.trim()) return "Title is required.";
     if (!rubric.trim()) return "Rubric is required.";
@@ -71,8 +72,14 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
         return "Reward must be a valid number.";
       }
     }
+    if (enableEncrypted) {
+      if (!executorAddress.trim() || !/^0x[0-9a-fA-F]{40}$/.test(executorAddress.trim())) {
+        return "Invalid executor address.";
+      }
+      if (!executorPubKey.trim()) return "Executor public key is required.";
+    }
     return null;
-  }, [title, rubric, deadline, reward]);
+  }, [title, rubric, deadline, reward, enableEncrypted, executorAddress, executorPubKey]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -80,25 +87,36 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
 
     const deadlineMs = new Date(deadline).getTime();
     if (deadlineMs <= Date.now()) {
-      // Clock read belongs in the event handler, not render.
       window.alert("Deadline must be in the future.");
       return;
     }
 
     const deadlineTs = BigInt(Math.floor(deadlineMs / 1000));
-    console.log("Creating bounty with", { title, rubric, deadlineTs, reward });
     const value = reward.trim() === "" ? 0n : parseEther(reward.trim());
     setCreatedId(null);
 
     try {
-      await tx.run({
-        address: contractAddress,
-        abi: aiJudgeAbi,
-        functionName: "createBounty",
-        args: [title.trim(), rubric.trim(), deadlineTs],
-        value,
-        chainId: ritualChain.id,
-      });
+      if (enableEncrypted) {
+        const execAddr = executorAddress.trim() as `0x${string}`;
+        const execKey = `0x${executorPubKey.trim().replace(/^0x/, "")}` as `0x${string}`;
+        await tx.run({
+          address: contractAddress,
+          abi: bountyJudgeAbi,
+          functionName: "createEncryptedBounty",
+          args: [title.trim(), rubric.trim(), deadlineTs, execAddr, execKey],
+          value,
+          chainId: ritualChain.id,
+        });
+      } else {
+        await tx.run({
+          address: contractAddress,
+          abi: bountyJudgeAbi,
+          functionName: "createBounty",
+          args: [title.trim(), rubric.trim(), deadlineTs],
+          value,
+          chainId: ritualChain.id,
+        });
+      }
     } catch {
       /* surfaced via tx.state */
     }
@@ -157,6 +175,45 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
             </Field>
           </div>
 
+          {/* Advanced Track: Encrypted Submissions toggle */}
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="enable-encrypted"
+              checked={enableEncrypted}
+              onChange={(e) => setEnableEncrypted(e.target.checked)}
+              className="h-4 w-4 rounded border-white/20 bg-black/30 accent-indigo-500"
+            />
+            <label htmlFor="enable-encrypted" className="text-xs font-medium text-zinc-300">
+              Enable encrypted submissions (Advanced Track)
+            </label>
+          </div>
+
+          {enableEncrypted && (
+            <div className="space-y-3 rounded-xl border border-indigo-500/20 bg-indigo-500/5 px-3 py-3">
+              <Notice tone="indigo">
+                Encrypted mode: answers are ECIES-encrypted with the TEE executor's public key.
+                Only the TEE enclave can decrypt them during batch judging.
+              </Notice>
+              <Field label="TEE Executor Address" hint="From TEEServiceRegistry">
+                <Input
+                  value={executorAddress}
+                  onChange={(e) => setExecutorAddress(e.target.value)}
+                  placeholder="0x..."
+                  className="font-mono text-xs"
+                />
+              </Field>
+              <Field label="Executor Public Key (hex)" hint="ECIES public key for encryption">
+                <Input
+                  value={executorPubKey}
+                  onChange={(e) => setExecutorPubKey(e.target.value)}
+                  placeholder="04..."
+                  className="font-mono text-xs"
+                />
+              </Field>
+            </div>
+          )}
+
           {validation && (title || rubric || reward) ? (
             <p className="text-xs text-amber-300">{validation}</p>
           ) : null}
@@ -166,7 +223,7 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
             disabled={!isConnected || !isContractConfigured || !!validation || tx.isBusy}
             className="w-full"
           >
-            {tx.isBusy ? "Creating…" : "Create bounty"}
+            {tx.isBusy ? "Creating…" : enableEncrypted ? "Create encrypted bounty" : "Create bounty"}
           </Button>
 
           {!isConnected && (
@@ -178,8 +235,8 @@ export function CreateBountyForm({ onCreated }: { onCreated?: (bountyId: bigint)
           {createdId !== null && (
             <Notice tone="green">
               Bounty created with id{" "}
-              <span className="font-mono font-semibold">#{createdId.toString()}</span>. Loaded
-              below.
+              <span className="font-mono font-semibold">#{createdId.toString()}</span>
+              {enableEncrypted && " (encrypted mode)"}. Loaded below.
             </Notice>
           )}
         </form>

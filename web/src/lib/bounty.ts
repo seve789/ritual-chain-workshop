@@ -74,7 +74,19 @@ export const STATUS_META: Record<
   finalized: { label: "Finalized", tone: "zinc" },
 };
 
-/** Can a participant still submit an answer? */
-export function canSubmit(b: Bounty, nowSeconds = Date.now() / 1000): boolean {
+/** Can a participant still submit a commitment? */
+export function canCommit(b: Bounty, nowSeconds = Date.now() / 1000): boolean {
   return !b.judged && !b.finalized && Number(b.deadline) > nowSeconds;
+}
+
+/** Can a participant reveal their answer? */
+export function canReveal(b: Bounty, nowSeconds = Date.now() / 1000): boolean {
+  if (b.judged || b.finalized) return false;
+  const deadlinePassed = Number(b.deadline) <= nowSeconds;
+  return deadlinePassed;
+}
+
+/** Legacy alias — can the participant submit? (Phase 1: commit) */
+export function canSubmit(b: Bounty, nowSeconds = Date.now() / 1000): boolean {
+  return canCommit(b, nowSeconds);
 }
