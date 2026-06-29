@@ -1,0 +1,19 @@
+# forge build artifacts
+hardhat/forge-out/
+
+# node_modules
+hardhat/node_modules/
+web/node_modules/
+
+# next.js build
+web/.next/
+
+# env files
+.env.local
+.env*.local
+
+# ide
+.idea/
+.vscode/
+*.swp
+*.swo
